@@ -210,11 +210,134 @@ def training(
         else:
             ssim_value = ssim(image, gt_image)
 
+        loss_dict = {
+            "Ll1": {"mean": Ll1.detach(), "var": var_l1.detach()},
+            "L_edge": {"mean": L_edge.detach(), "var": var_edge.detach()},
+            "L_depth": {"mean": L_depth.detach(), "var": var_depth.detach()},
+        }
+
+        names = ["Ll1", "L_edge", "L_depth"]
+
+        # --- General hyperparameters ---
+
+        ema_decay = 0.98
+        lambda_blend = 0.6
+        gamma_var = 0.4
+        beta_progress = 25.0
+        gamma_progress = 0.6
+        delta_band = 0.3
+        tau_w = 0.9
+        delta_step_max = 0.05
+        K_ref = 2000
+        update_interval = 1
+
+        # --- CGR hyperparameters ---
+        coop_ratio = 0.5
+        tau_conf = 0.9
+        conf_clip = (1e-4, 1e2)
+
+        w_scale_reference = torch.tensor([0.8, 0.25, 0.3], device="cuda")
+
+        if "ema_stats" not in locals():
+            ema_stats = {
+                n: {
+                    "mu": torch.zeros(1, device="cuda"),
+                    "var": torch.ones(1, device="cuda"),
+                    "mu_prev": torch.zeros(1, device="cuda"),
+                }
+                for n in names
+            }
+            var_ref = {n: torch.ones(1, device="cuda") for n in names}
+            w_prev = {
+                n: base.clone().detach() for n, base in zip(names, w_scale_reference)
+            }
+
+            conf_prev = {n: torch.tensor(1.0, device="cuda") for n in names}
+
+        for n in names:
+            mu_b = loss_dict[n]["mean"]
+            var_b = loss_dict[n]["var"]
+            if var_b is None:
+                var_b = (mu_b - ema_stats[n]["mu"]) ** 2
+            var_b = torch.clamp(var_b, 1e-6, 1e2)
+
+            ema_stats[n]["mu_prev"] = ema_stats[n]["mu"]
+            ema_stats[n]["mu"] = ema_decay * ema_stats[n]["mu"] + (1 - ema_decay) * mu_b
+            ema_stats[n]["var"] = (
+                ema_decay * ema_stats[n]["var"] + (1 - ema_decay) * var_b
+            )
+
+        for n in names:
+            if iteration <= K_ref:
+                var_ref[n] = 0.995 * var_ref[n] + 0.005 * ema_stats[n]["var"]
+
+        progress = {n: -(ema_stats[n]["mu"] - ema_stats[n]["mu_prev"]) for n in names}
+        phi = {
+            n: torch.sigmoid(beta_progress * progress[n]).clamp(0.0, 1.0) for n in names
+        }
+
+        sigma_eff = {
+            n: torch.clamp(
+                ema_stats[n]["var"] * (1 - gamma_progress * phi[n]), 1e-6, 1e2
+            )
+            for n in names
+        }
+
+        w_now = {}
+        for i, n in enumerate(names):
+            base = w_scale_reference[i]
+            g = (var_ref[n] / (sigma_eff[n] + 1e-8)) ** gamma_var
+            w_tilde = base * (lambda_blend + (1 - lambda_blend) * g)
+            low, high = base * (1 - delta_band), base * (1 + delta_band)
+            w_tilde = torch.clamp(w_tilde, low, high)
+            w_smoothed = tau_w * w_prev[n] + (1 - tau_w) * w_tilde
+            diff = torch.clamp(w_smoothed - w_prev[n], -delta_step_max, delta_step_max)
+            w_now[n] = w_prev[n] + diff
+            w_prev[n] = w_now[n]
+
+        confidence = {}
+        for n in names:
+            conf_i = phi[n] / (torch.sqrt(sigma_eff[n]) + 1e-8)
+            conf_i = torch.clamp(conf_i, *conf_clip)
+            conf_i = tau_conf * conf_prev[n] + (1 - tau_conf) * conf_i
+            conf_prev[n] = conf_i
+            confidence[n] = conf_i
+
+        conf_sum = sum(confidence.values()) + 1e-8
+        confidence_norm = {n: confidence[n] / conf_sum for n in names}
+
+        w_coop = {}
+        for n in names:
+            local = w_now[n]
+            coop = local * confidence_norm[n] * len(names)
+            w_coop[n] = (1 - coop_ratio) * local + coop_ratio * coop
+
+        total_ref = w_scale_reference.sum()
+        total_now = sum(w_coop.values()) + 1e-8
+        scale_factor = total_ref / total_now
+        for n in names:
+            w_coop[n] *= scale_factor
+            w_now[n] = w_coop[n]
+
+        w_L1, w_Edge, w_Depth = [w_now[n] for n in names]
+
+        if iteration % 100 == 0 and tb_writer:
+            for name in loss_dict:
+                tb_writer.add_scalar(
+                    f"Uncertainty/{name}_mu_EMA", ema_stats[name]["mu"], iteration
+                )
+                tb_writer.add_scalar(
+                    f"Uncertainty/{name}_var_EMA", ema_stats[name]["var"], iteration
+                )
+                tb_writer.add_scalar(
+                    f"Uncertainty/{name}_w_var", w_now[name], iteration
+                )
+
         loss = (
-            (1.0 - opt.lambda_dssim) * Ll1
-            + opt.lambda_dssim * (1.0 - ssim_value)
-            + 0.3 * L_edge
-            + 0.2 * L_depth
+            w_L1 * Ll1
+            + (1.0 - w_L1) * (1.0 - ssim_value)
+            + w_Edge * L_edge
+            + w_Depth * L_depth
         )
 
         loss.backward()

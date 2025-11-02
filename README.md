@@ -7,7 +7,7 @@
 
 ---
 
-## 🧠 Overview
+## Overview
 
 **GUAC-GS (Guided Uncertainty-Adaptive Cooperation for 3D Gaussian Splatting)** introduces an *adaptive uncertainty weighting framework* for **photometric-geometric optimization** in 3D Gaussian Splatting.  
 It enhances training stability and scene reconstruction quality through a **four-stage progression of loss adaptation**.

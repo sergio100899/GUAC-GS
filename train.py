@@ -224,7 +224,7 @@ def training(
         lambda_blend = 0.6
         gamma_var = 0.4
         beta_progress = 25.0
-        gamma_progress = 0.6
+        gamma_progress = 0.8
         delta_band = 0.3
         tau_w = 0.9
         delta_step_max = 0.05
@@ -236,7 +236,7 @@ def training(
         tau_conf = 0.9
         conf_clip = (1e-4, 1e2)
 
-        w_scale_reference = torch.tensor([0.8, 0.25, 0.3], device="cuda")
+        w_scale_reference = torch.tensor([0.8, 0.25, 0.25], device="cuda")
 
         if "ema_stats" not in locals():
             ema_stats = {

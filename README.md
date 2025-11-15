@@ -76,7 +76,7 @@ If you use this work, please cite both GUAC-GS and the original 3D Gaussian Spla
 
 @misc{ortiz2025guacgs,
   title   = {GUAC-GS: Gaussian Uncertainty-Aware Cooperative 3D Gaussian Splatting},
-  author  = {Sergio Ortiz},
+  author  = {Sergio Ortiz and Edgar Medina and Rodney Lopez and Jared Orihuela},
   year    = {2025},
   howpublished = {\url{https://github.com/sergio100899/guac-3dgs}},
   note    = {Extension of 3D Gaussian Splatting (Kerbl et al., ACM TOG 2023)}

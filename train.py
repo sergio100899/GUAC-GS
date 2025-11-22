@@ -220,21 +220,15 @@ def training(
 
         # --- General hyperparameters ---
 
-        ema_decay = 0.98
-        lambda_blend = 0.6
-        gamma_var = 0.4
-        beta_progress = 25.0
+        ema_decay = 0.9
+        beta_progress = 50.0
         gamma_progress = 0.8
-        delta_band = 0.3
-        tau_w = 0.9
-        delta_step_max = 0.05
+        gamma_var = 0.4
+        lambda_blend = 0.6
         K_ref = 2000
-        update_interval = 1
 
         # --- CGR hyperparameters ---
         coop_ratio = 0.5
-        tau_conf = 0.9
-        conf_clip = (1e-4, 1e2)
 
         w_scale_reference = torch.tensor([0.8, 0.25, 0.25], device="cuda")
 
@@ -248,11 +242,6 @@ def training(
                 for n in names
             }
             var_ref = {n: torch.ones(1, device="cuda") for n in names}
-            w_prev = {
-                n: base.clone().detach() for n, base in zip(names, w_scale_reference)
-            }
-
-            conf_prev = {n: torch.tensor(1.0, device="cuda") for n in names}
 
         for n in names:
             mu_b = loss_dict[n]["mean"]
@@ -287,20 +276,11 @@ def training(
         for i, n in enumerate(names):
             base = w_scale_reference[i]
             g = (var_ref[n] / (sigma_eff[n] + 1e-8)) ** gamma_var
-            w_tilde = base * (lambda_blend + (1 - lambda_blend) * g)
-            low, high = base * (1 - delta_band), base * (1 + delta_band)
-            w_tilde = torch.clamp(w_tilde, low, high)
-            w_smoothed = tau_w * w_prev[n] + (1 - tau_w) * w_tilde
-            diff = torch.clamp(w_smoothed - w_prev[n], -delta_step_max, delta_step_max)
-            w_now[n] = w_prev[n] + diff
-            w_prev[n] = w_now[n]
+            w_now[n] = base * (lambda_blend + (1 - lambda_blend) * g)
 
         confidence = {}
         for n in names:
             conf_i = phi[n] / (torch.sqrt(sigma_eff[n]) + 1e-8)
-            conf_i = torch.clamp(conf_i, *conf_clip)
-            conf_i = tau_conf * conf_prev[n] + (1 - tau_conf) * conf_i
-            conf_prev[n] = conf_i
             confidence[n] = conf_i
 
         conf_sum = sum(confidence.values()) + 1e-8
@@ -331,6 +311,9 @@ def training(
                 )
                 tb_writer.add_scalar(
                     f"Uncertainty/{name}_w_var", w_now[name], iteration
+                )
+                tb_writer.add_scalar(
+                    f"Uncertainty/{name}_sigmoid_gate", phi[name], iteration
                 )
 
         loss = (

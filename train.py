@@ -46,11 +46,18 @@ except ImportError:
     TENSORBOARD_FOUND = False
 
 try:
-    from fused_ssim import fused_ssim
+    from fused_ssim import fused_ssim, fused_ssim_map
 
     FUSED_SSIM_AVAILABLE = True
-except:
-    FUSED_SSIM_AVAILABLE = False
+    FUSED_SSIM_MAP_AVAILABLE = True
+except Exception:
+    try:
+        from fused_ssim import fused_ssim
+
+        FUSED_SSIM_AVAILABLE = True
+    except Exception:
+        FUSED_SSIM_AVAILABLE = False
+    FUSED_SSIM_MAP_AVAILABLE = False
 
 try:
     from diff_gaussian_rasterization import SparseGaussianAdam  # noqa
@@ -205,23 +212,35 @@ def training(
             gt_image,
         )
 
-        if FUSED_SSIM_AVAILABLE:
-            ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+        if FUSED_SSIM_AVAILABLE and FUSED_SSIM_MAP_AVAILABLE:
+            ssim_map = fused_ssim_map(image.unsqueeze(0), gt_image.unsqueeze(0))
+            L_ssim = (1.0 - ssim_map).mean()
+            var_ssim = (1.0 - ssim_map).var(unbiased=False)
         else:
-            ssim_value = ssim(image, gt_image)
+            ssim_scalar = (
+                fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
+                if FUSED_SSIM_AVAILABLE
+                else ssim(image, gt_image)
+            )
+            L_ssim = 1.0 - ssim_scalar
+            var_ssim = None
 
         loss_dict = {
             "Ll1": {"mean": Ll1.detach(), "var": var_l1.detach()},
             "L_edge": {"mean": L_edge.detach(), "var": var_edge.detach()},
             "L_depth": {"mean": L_depth.detach(), "var": var_depth.detach()},
+            "L_ssim": {
+                "mean": L_ssim.detach(),
+                "var": var_ssim.detach() if var_ssim is not None else None,
+            },
         }
 
-        names = ["Ll1", "L_edge", "L_depth"]
+        names = ["Ll1", "L_ssim", "L_edge", "L_depth"]
 
         # --- General hyperparameters ---
 
         ema_decay = 0.9
-        beta_progress = 50.0
+        beta_progress = 40.0
         gamma_progress = 0.8
         gamma_var = 0.4
         lambda_blend = 0.6
@@ -230,7 +249,7 @@ def training(
         # --- CGR hyperparameters ---
         coop_ratio = 0.5
 
-        w_scale_reference = torch.tensor([0.8, 0.25, 0.25], device="cuda")
+        w_scale_reference = torch.tensor([1.2, 0.4, 0.25, 0.3], device="cuda")
 
         if "ema_stats" not in locals():
             ema_stats = {
@@ -292,6 +311,8 @@ def training(
             coop = local * confidence_norm[n] * len(names)
             w_coop[n] = (1 - coop_ratio) * local + coop_ratio * coop
 
+        # Keep a copy before global rescaling for TensorBoard
+        w_now_pre_scale = {n: w_now[n].clone() for n in names}
         total_ref = w_scale_reference.sum()
         total_now = sum(w_coop.values()) + 1e-8
         scale_factor = total_ref / total_now
@@ -299,7 +320,7 @@ def training(
             w_coop[n] *= scale_factor
             w_now[n] = w_coop[n]
 
-        w_L1, w_Edge, w_Depth = [w_now[n] for n in names]
+        w_L1, w_SSIM, w_Edge, w_Depth = [w_now[n] for n in names]
 
         if iteration % 100 == 0 and tb_writer:
             for name in loss_dict:
@@ -313,15 +334,19 @@ def training(
                     f"Uncertainty/{name}_w_var", w_now[name], iteration
                 )
                 tb_writer.add_scalar(
+                    f"Uncertainty/{name}_w_var_pre_scale",
+                    w_now_pre_scale[name],
+                    iteration,
+                )
+                tb_writer.add_scalar(
+                    f"Uncertainty/{name}_progress", progress[name], iteration
+                )
+                tb_writer.add_scalar(
                     f"Uncertainty/{name}_sigmoid_gate", phi[name], iteration
                 )
+            tb_writer.add_scalar("Uncertainty/scale_factor", scale_factor, iteration)
 
-        loss = (
-            w_L1 * Ll1
-            + (1.0 - w_L1) * (1.0 - ssim_value)
-            + w_Edge * L_edge
-            + w_Depth * L_depth
-        )
+        loss = w_L1 * Ll1 + w_SSIM * L_ssim + w_Edge * L_edge + w_Depth * L_depth
 
         loss.backward()
 

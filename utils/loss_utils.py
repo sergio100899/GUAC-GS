@@ -32,6 +32,16 @@ except:
 C1 = 0.01**2
 C2 = 0.03**2
 
+try:
+    from fused_ssim import fused_ssim_map
+
+    FUSED_SSIM_MAP_AVAILABLE = True
+except Exception:
+    fused_ssim_map = None
+    FUSED_SSIM_MAP_AVAILABLE = False
+
+ALLOWED_PADDING = {"same", "valid"}
+
 
 class FusedSSIMMap(torch.autograd.Function):
     @staticmethod
@@ -168,3 +178,65 @@ def _ssim(img1, img2, window, window_size, channel, size_average=True):
 def fast_ssim(img1, img2):
     ssim_map = FusedSSIMMap.apply(C1, C2, img1, img2)
     return ssim_map.mean()
+
+
+def ssim_full_map(img1, img2, window_size=11, padding="same"):
+    """
+    Returns the SSIM map (no reduction). padding can be 'same' or 'valid'.
+    """
+    assert padding in ALLOWED_PADDING
+    channel = img1.size(-3)
+    window = create_window(window_size, channel)
+
+    if img1.is_cuda:
+        window = window.cuda(img1.get_device())
+    window = window.type_as(img1)
+
+    mu1 = F.conv2d(img1, window, padding=window_size // 2, groups=channel)
+    mu2 = F.conv2d(img2, window, padding=window_size // 2, groups=channel)
+
+    mu1_sq = mu1.pow(2)
+    mu2_sq = mu2.pow(2)
+    mu1_mu2 = mu1 * mu2
+
+    sigma1_sq = (
+        F.conv2d(img1 * img1, window, padding=window_size // 2, groups=channel)
+        - mu1_sq
+    )
+    sigma2_sq = (
+        F.conv2d(img2 * img2, window, padding=window_size // 2, groups=channel)
+        - mu2_sq
+    )
+    sigma12 = (
+        F.conv2d(img1 * img2, window, padding=window_size // 2, groups=channel)
+        - mu1_mu2
+    )
+
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / (
+        (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2)
+    )
+
+    if padding == "valid":
+        pad = window_size // 2
+        ssim_map = ssim_map[:, :, pad:-pad, pad:-pad]
+
+    return ssim_map
+
+
+def ssim_loss_with_stats(
+    img1, img2, use_fused=False, padding="same", window_size=11, train=True
+):
+    """
+    Computes SSIM loss (1 - SSIM) mean and variance. Uses fused-ssim if requested
+    and available, otherwise falls back to the reference implementation.
+    """
+    if use_fused and FUSED_SSIM_MAP_AVAILABLE:
+        ssim_map = fused_ssim_map(img1, img2, padding=padding, train=train)
+    else:
+        ssim_map = ssim_full_map(img1, img2, window_size=window_size, padding=padding)
+
+    loss_map = 1.0 - ssim_map
+    mu = loss_map.mean()
+    var = loss_map.var(unbiased=False)
+
+    return mu, var, 1.0 - mu
